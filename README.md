@@ -33,10 +33,10 @@ automatically use the apt-cache-ng proxy to accelerate build performance.
 You can tweak some variables towards the bottom of the `Ubuntu-MATE-image` script.
 
 ```bash
-FLAVOUR="ubuntu-mate"
+FLAVOUR="Ubuntu-Mate"
 IMG_QUALITY="-beta1"
-IMG_VER="22.04"
-IMG_RELEASE="jammy"
+IMG_VER="23.04"
+IMG_RELEASE="mantic"
 IMG_ARCH="armhf"
 ```
 
