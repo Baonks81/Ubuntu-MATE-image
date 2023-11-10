@@ -43,7 +43,7 @@ IMG_ARCH="armhf"
 ### Usage
 
 The following incantation will build a Ubuntu MATE 22.04 armhf image for
-Raspberry Pi.
+Nexus 7 2012 grouper and others armhf.
 
 ```bash
 sudo ./Ubuntu-MATE-image
