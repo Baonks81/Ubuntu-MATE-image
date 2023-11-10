@@ -60,7 +60,7 @@ for other Ubuntu flavours/desktops.
 
 ## Bootloaders
 
-This is the bootloader configuration from Ubuntu 22.04.
+This is the bootloader configuration from Ubuntu 23.04.
 
 ### cloud-init
 
@@ -73,7 +73,7 @@ Remove these files:
 
 ```
 An overview of the files on the /boot partition (the 1st partition
-on the SD card) used by the Ubuntu boot process (roughly in order) is as
+on the LVM) used by the Ubuntu boot process (roughly in order) is as
 follows:
 
 * bootcode.bin   - this is the second stage bootloader loaded by all pis with
