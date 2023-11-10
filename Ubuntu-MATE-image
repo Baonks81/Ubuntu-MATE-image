@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+LC_ALL=C
+
+# Display help usage
+function usage () {
+  echo
+  echo "Usage"
+  echo "  $0"
+  echo
+}
+
+function sync_from() {
+    if [ -z "${1}" ] || [ -z "${2}" ]; then
+        echo "ERROR! Source stages to sync were not passed."
+        exit 1
+    fi
+
+    local B_SOURCE="${1}"
+    local R_SOURCE="${2}"
+
+    if [ -d "${B}" ] && [ -d "${R}" ]; then
+        echo "Syncing from ${B_SOURCE}..."
+        rsync -aHAXx --delete "${B_SOURCE}/" "${B}/"
+        echo "Syncing from ${R_SOURCE}..."
+        rsync -aHAXx --delete "${R_SOURCE}/" "${R}/"
+    else
+        echo "ERROR! Either ${B} or ${R} do not exist!"
+        exit 1
+    fi
+}
+
+function nspawn() {
+    # Create basic resolv.conf for bind mounting inside the container
+    echo "nameserver 1.1.1.1" > "${R_STAGE_0}/resolv.conf"
+
+    if pidof apt-cacher-ng && [ -d "${R}/etc/apt/apt.conf.d" ]; then
+        echo "Acquire::http { Proxy \"http://${APT_CACHE_IP}:3142\"; }" > "${R}/etc/apt/apt.conf.d/90cache"
+    fi
+
+    # Make sure the container has a machine-id
+    systemd-machine-id-setup --root "${R}" --print
+
+    echo "Running: ${@}"
+    # Bind mount resolv.conf and the firmware, set the hostname and spawn
+    systemd-nspawn \
+      --resolv-conf=off \
+      --bind-ro="${R_STAGE_0}/resolv.conf":/etc/resolv.conf \
+      --bind="${B}":/boot/firmware \
+      --machine="${FLAVOUR}" \
+      --directory "${R}" "${@}"
+
+    if [ -e "${R}/etc/apt/apt.conf.d/90cache" ]; then
+        rm -f "${R}/etc/apt/apt.conf.d/90cache"
+    fi
+}
+
+function snap_preseed() {
+    local SNAP_NAME="${1}"
+    local SNAP_CHANNEL="${2}"
+    local SNAP_CONFINEMENT=""
+    local SNAP_FILE=""
+
+    # Download a snap only once
+    if ls -1 "${R}"/var/lib/snapd/seed/snaps/"${SNAP_NAME}"_*.snap >/dev/null 2>&1; then
+        return
+    fi
+
+    nspawn env SNAPPY_STORE_NO_CDN=1 UBUNTU_STORE_ARCH="${IMG_ARCH}" snap download --target-directory=/var/lib/snapd/seed "${SNAP_NAME}" --channel="${SNAP_CHANNEL}"
+    mv -v "${R}"/var/lib/snapd/seed/*.assert "${R}"/var/lib/snapd/seed/assertions/
+    mv -v "${R}"/var/lib/snapd/seed/*.snap "${R}"/var/lib/snapd/seed/snaps/
+    if [ "${SNAP_NAME}" == "snapd" ]; then
+        touch "${R}/var/lib/snapd/seed/.snapd-explicit-install-stamp"
+    fi
+
+    # Add the snap to the seed.yaml
+    if [ ! -e "${R}"/var/lib/snapd/seed/seed.yaml ]; then
+        echo "snaps:" > "${R}"/var/lib/snapd/seed/seed.yaml
+    fi
+
+    cat <<EOF >> "${R}"/var/lib/snapd/seed/seed.yaml
+  -
+    name: ${SNAP_NAME}
+    channel: ${SNAP_CHANNEL}
+EOF
+
+    # Process classic snaps
+    if [ -e "${R_STAGE_0}/${SNAP_NAME}.info" ]; then
+        SNAP_CONFINEMENT=$(grep confinement "${R_STAGE_0}/${SNAP_NAME}.info" | cut -d':' -f2 | sed 's/ //g')
+        echo "${SNAP_CONFINEMENT}"
+        case "${SNAP_CONFINEMENT}" in
+            *classic*) echo "    classic: true" >> "${R}"/var/lib/snapd/seed/seed.yaml;;
+        esac
+    fi
+
+    echo -n "    file: " >> "${R}"/var/lib/snapd/seed/seed.yaml
+    SNAP_FILE=$(ls -1 "${R}"/var/lib/snapd/seed/snaps/${SNAP_NAME}_*.snap)
+    basename "${SNAP_FILE}" >> "${R}"/var/lib/snapd/seed/seed.yaml
+}
+
+function stage_01_bootstrap() {
+    local REPO=""
+    export B="${B_STAGE_1}"
+    export R="${R_STAGE_1}"
+
+    rm -rf "${B_STAGE_1}"/*
+    rm -rf "${R_STAGE_1}"/*
+
+    # Required tools on the host
+    apt-get -y install binfmt-support debootstrap device-tree-compiler git \
+    graphicsmagick-imagemagick-compat iproute2 optipng qemu-user-static rsync \
+    systemd-container ubuntu-keyring util-linux whois xz-utils
+
+    # Bootstrap a minimal Ubuntu
+    #   Include cloud-guest-utils; prevents cloud-image-utils, and therefore qemu-system-x86, being installed later
+
+    if pidof apt-cacher-ng; then
+        REPO="http://localhost:3142/ports.ubuntu.com/"
+    else
+        REPO="http://ports.ubuntu.com/"
+    fi
+
+    debootstrap \
+        --arch="${IMG_ARCH}" \
+        --cache-dir="${R_STAGE_0}" \
+        --components=main,restricted,universe,multiverse \
+        --foreign \
+        --include=cloud-guest-utils \
+        "${IMG_RELEASE}" "${R}" "${REPO}"
+    nspawn /debootstrap/debootstrap \
+        --second-stage
+
+    cat <<EOM >"${R}/etc/apt/sources.list"
+deb http://ports.ubuntu.com/ ${IMG_RELEASE} main restricted universe multiverse
+deb-src http://ports.ubuntu.com/ ${IMG_RELEASE} main restricted universe multiverse
+
+deb http://ports.ubuntu.com/ ${IMG_RELEASE}-updates main restricted universe multiverse
+deb-src http://ports.ubuntu.com/ ${IMG_RELEASE}-updates main restricted universe multiverse
+
+deb http://ports.ubuntu.com/ ${IMG_RELEASE}-security main restricted universe multiverse
+deb-src http://ports.ubuntu.com/ ${IMG_RELEASE}-security main restricted universe multiverse
+
+deb http://ports.ubuntu.com/ ${IMG_RELEASE}-backports main restricted universe multiverse
+deb-src http://ports.ubuntu.com/ ${IMG_RELEASE}-backports main restricted universe multiverse
+EOM
+
+    # Set locale to C.UTF-8 by default.
+    # https://git.launchpad.net/livecd-rootfs/tree/live-build/auto/build#n159
+    echo "LANG=C.UTF-8" > "${R}/etc/default/locale"
+
+    nspawn hostnamectl --static set-hostname "${FLAVOUR}"
+    echo "${FLAVOUR}" > "${R}/etc/hostname"
+    sed -i "1s|.*|127.0.0.1\tlocalhost ${FLAVOUR}|" "${R}/etc/hosts"
+
+    nspawn apt-get -y update
+    nspawn apt-get -y upgrade
+    nspawn apt-get -y dist-upgrade
+
+    # Install first boot filesystem expansion
+    nspawn apt-get -y install --no-install-recommends cloud-guest-utils \
+    cloud-initramfs-growroot
+
+    # Add standard Ubuntu userspace
+    nspawn apt-get -y install standard^
+
+    # Add the Raspberry Pi specific tweaks
+    #nspawn apt-get -y install ubuntu-raspi-settings
+}
+
+function stage_02_desktop() {
+    export B="${B_STAGE_2}"
+    export R="${R_STAGE_2}"
+    sync_from "${B_STAGE_1}" "${R_STAGE_1}"
+
+    nspawn apt-get -y install ubuntu-mate-core^
+    nspawn apt-get -y install ubuntu-mate-desktop^
+
+    # Instruct netplan to hand all network management to NetworkManager
+    cat <<EOM > "${R}/etc/netplan/01-network-manager-all.yaml"
+# Let NetworkManager manage all devices on this system
+network:
+  version: 2
+  renderer: NetworkManager
+EOM
+}
+
+function stage_03_snap() {
+    local ACCOUNT_KEY=""
+    local BASE_SNAP=""
+    local SEED_SNAPS="ubuntu-mate-welcome software-boutique ubuntu-mate-pi snapd-desktop-integration gtk-common-themes gnome-3-38-2004 firefox"
+    local SNAP_CHANNEL=""
+    local SNAP_PRESEED_FAILED=0
+    # https://git.launchpad.net/livecd-rootfs/tree/live-build/functions#n491
+    # https://discourse.ubuntu.com/t/seeding-a-classic-ubuntu-image/19756
+    # https://forum.snapcraft.io/t/broken-dependency-of-content-snaps-during-seeding/11566
+    # https://bugs.launchpad.net/ubuntu-image/+bug/1958275
+
+    export B="${B_STAGE_3}"
+    export R="${R_STAGE_3}"
+    sync_from "${B_STAGE_2}" "${R_STAGE_2}"
+
+    nspawn apt-get -y install xdelta3
+
+    # Prepare assertions
+    mkdir -p "${R}"/var/lib/snapd/seed/{assertions,snaps}
+    snap known --remote model series=16 model=generic-classic brand-id=generic > "${R}/var/lib/snapd/seed/assertions/model"
+    ACCOUNT_KEY=$(grep "^sign-key-sha3-384" "${R}/var/lib/snapd/seed/assertions/model" | cut -d':' -f2 | sed 's/ //g')
+    snap known --remote account-key public-key-sha3-384="${ACCOUNT_KEY}" > "${R}/var/lib/snapd/seed/assertions/account-key"
+    snap known --remote account account-id=generic > "${R}/var/lib/snapd/seed/assertions/account"
+
+    # Download the snaps
+    for SNAP_NAME in ${SEED_SNAPS}; do
+        # snapd-desktop-integration is not available in stable for armhf yet
+        if [ "${IMG_ARCH}" == "armhf" ] && [ "${SNAP_NAME}" == "snapd-desktop-integration" ]; then
+            SNAP_CHANNEL="candidate"
+        else
+            case "${SNAP_NAME}" in
+                software-boutique|ubuntu-mate-pi) SNAP_CHANNEL="stable";;
+                *) SNAP_CHANNEL="stable/ubuntu-${IMG_VER}";;
+            esac
+        fi
+
+        snap_preseed "${SNAP_NAME}" "${SNAP_CHANNEL}"
+
+        # Download any required base snaps
+        if snap info --verbose "${R}"/var/lib/snapd/seed/snaps/"${SNAP_NAME}"*.snap > "${R_STAGE_0}/${SNAP_NAME}.info"; then
+            if grep -q '^base:' "${R_STAGE_0}/${SNAP_NAME}.info"; then
+                BASE_SNAP=$(awk '/^base:/ {print $2}' "${R_STAGE_0}/${SNAP_NAME}.info")
+                snap_preseed "${BASE_SNAP}" stable
+                case "${BASE_SNAP}" in
+                    core[0-9]*) snap_preseed snapd stable;;
+                esac
+            fi
+        fi
+    done
+
+    # Validate seed.yaml
+    if snap debug validate-seed "${R}"/var/lib/snapd/seed/seed.yaml; then
+        cat "${R}"/var/lib/snapd/seed/seed.yaml
+    else
+        echo "ERROR! seed.yaml validation failed."
+        exit 1
+    fi
+
+    # Preseed the snaps
+    #  - NOTE! This is how livecd-rootfs runs snap-preeseed, but it fails on
+    #  - armhh and the snap preseeding does complete during oem-setup.
+    #  - Disabled for now.
+    # snap-preseed operates from outside the image being prepared and
+    # requires some mounts to be setup
+    if false; then
+        mount --rbind /dev "${R}/dev"
+        mount proc-live -t proc "${R}/proc"
+        mount sysfs-live -t sysfs "${R}/sys"
+        mount securityfs -t securityfs "${R}/sys/kernel/security"
+
+        /usr/lib/snapd/snap-preseed --reset "${R}"
+
+        if [ "${IMG_ARCH}" != "armhf" ]; then
+            if ! /usr/lib/snapd/snap-preseed "${R}"; then
+                SNAP_PRESEED_FAILED=1
+            fi
+        fi
+
+        for MOUNT in "${R}/sys/kernel/security" "${R}/sys" "${R}/proc" "${R}/dev"; do
+            echo "unmounting: ${MOUNT}"
+            mount --make-private "${MOUNT}"
+            umount -l "${MOUNT}"
+            udevadm settle
+            sleep 5
+        done
+
+        if [ ${SNAP_PRESEED_FAILED} -eq 1 ]; then
+            echo "ERROR! snap-preseed failed."
+            exit 1
+        fi
+
+        nspawn apparmor_parser --skip-read-cache --write-cache --skip-kernel-load --verbose  -j $(nproc) /etc/apparmor.d
+    fi
+}
+
+function stage_04_kernel() {
+    export B="${B_STAGE_4}"
+    export R="${R_STAGE_4}"
+    sync_from "${B_STAGE_3}" "${R_STAGE_3}"
+
+    cat <<'EOM' > "${B}/README"
+An overview of the files on the /boot/firmware partition (the 1st partition
+on the SD card) used by the Ubuntu boot process (roughly in order) is as
+follows:
+
+* bootcode.bin   - this is the second stage bootloader loaded by all pis with
+                   the exception of the pi4 (where this is replaced by flash
+                   memory)
+* config.txt     - the configuration file read by the boot process
+* start*.elf     - the third stage bootloader, which handles device-tree
+                   modification and which loads...
+* vmlinuz        - the Linux kernel
+* cmdline.txt    - the Linux kernel command line
+* initrd.img     - the initramfs
+EOM
+
+    if [ "${IMG_ARCH}"  == "arm64" ]; then
+        ARM64="# Config settings specific to arm64
+arm_64bit=1
+dtoverlay=dwc2"
+    else
+        ARM64=""
+    fi
+
+    cat <<EOM > "${B}/config.txt"
+[all]
+kernel=vmlinuz
+cmdline=cmdline.txt
+initramfs initrd.img followkernel
+
+[pi4]
+max_framebuffers=2
+arm_boost=1
+
+[all]
+# Enable the audio output, I2C and SPI interfaces on the GPIO header. As these
+# parameters related to the base device-tree they must appear *before* any
+# other dtoverlay= specification
+dtparam=audio=on
+dtparam=i2c_arm=on
+dtparam=spi=on
+
+# Comment out the following line if the edges of the desktop appear outside
+# the edges of your display
+disable_overscan=1
+
+# If you have issues with audio, you may try uncommenting the following line
+# which forces the HDMI output into HDMI mode instead of DVI (which doesn't
+# support audio output)
+hdmi_drive=2
+
+[cm4]
+# Enable the USB2 outputs on the IO board (assuming your CM4 is plugged into
+# such a board)
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+
+# Enable the KMS ("full" KMS) graphics overlay, leaving GPU memory as the
+# default (the kernel is in control of graphics memory with full KMS)
+dtoverlay=vc4-kms-v3d
+
+# Autoload overlays for any recognized cameras or displays that are attached
+# to the CSI/DSI ports. Please note this is for libcamera support, *not* for
+# the legacy camera stack
+camera_auto_detect=1
+display_auto_detect=1
+
+${ARM64}
+EOM
+
+    echo "zswap.enabled=1 zswap.zpool=z3fold zswap.compressor=lz4 dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc quiet splash" > "${B}/cmdline.txt"
+    cat <<'EOM' > "${R}/etc/fstab"
+LABEL=pmOS_root     /               ext4  discard,noatime  0  1
+LABEL=pmOS_boot  /boot  ext2  defaults                          0  1
+EOM
+
+    #nspawn apt-get -y install libraspberrypi0 libraspberrypi-bin \
+    linux-firmware-raspi linux-image-raspi linux-modules-extra-raspi \
+    pi-bluetooth rpi-eeprom
+
+    # Prevent triggerhappy from being installed
+    #nspawn apt-get -y install --no-install-recommends raspi-config
+    #nspawn systemctl disable raspi-config
+
+    local NEW_KERNEL=$(ls -1 "${R}"/boot/vmlinuz-* | tail -n1 | awk -F/ '{print $NF}' | cut -d'-' -f2-4)
+    if [ -z "${NEW_KERNEL}" ]; then
+        echo "ERROR! Could not detect the new kernel version"
+        exit 1
+    fi
+    echo "Kernel: ${NEW_KERNEL}"
+
+    # Copy firmware, devicetree, overlays and kernel to the boot file system
+    #cp -v "${R}/lib/linux-firmware-raspi/"* "${B}/"
+    #cp -av "${R}/lib/firmware/${NEW_KERNEL}/device-tree/"* "${B}/"
+    cp -arv "${R}/lib/firmware/"* "${B}/lib/firmware/"
+
+    # Move the arm64 device-tree
+    if [ -d "${B}/broadcom" ]; then
+        mv -v "${B}/broadcom/"*.dtb "${B}"/
+        rm -rf "${B}/broadcom"
+    fi
+
+    #cp -av "${R}/boot/vmlinuz-${NEW_KERNEL}" "${B}/vmlinuz"
+    #cp -av "${R}/boot/initrd.img-${NEW_KERNEL}" "${B}/initrd.img"
+    cp -arv "${R}/boot/"* "${B}/boot"
+}
+
+function stage_05_config() {
+    export B="${B_STAGE_5}"
+    export R="${R_STAGE_5}"
+    sync_from "${B_STAGE_4}" "${R_STAGE_4}"
+
+    # Adds lz4 and z3fold modules to initramfs.
+    # - https://ubuntu.com/blog/how-low-can-you-go-running-ubuntu-desktop-on-a-2gb-raspberry-pi-4
+    echo lz4    >> "${R}/etc/initramfs-tools/modules"
+    echo zstd   >> "${R}/etc/initramfs-tools/modules"
+
+    nspawn systemctl enable fontconfig-regenerate-cache.service
+
+    # Create user and groups
+    local DATE=""
+    DATE=$(date +%m%H%M%S)
+    local PASSWD=""
+    PASSWD=$(mkpasswd -m sha-512 oem "${DATE}")
+    nspawn addgroup --gid 29999 oem
+
+    nspawn adduser --gecos "OEM Configuration (temporary user)" --add_extra_groups --disabled-password --gid 29999 --uid 29999 oem
+    nspawn usermod -a -G adm,sudo -p "${PASSWD}" oem
+
+    nspawn apt-get -y install --no-install-recommends oem-config-gtk ubiquity-frontend-gtk ubiquity-ubuntu-artwork oem-config-slideshow-ubuntu-mate
+    # Force the slideshow to use Ubuntu MATE artwork.
+    sed -i 's/oem-config-slideshow-ubuntu/oem-config-slideshow-ubuntu-mate/' "${R}/usr/lib/ubiquity/plugins/ubi-usersetup.py"
+    sed -i 's/oem-config-slideshow-ubuntu/oem-config-slideshow-ubuntu-mate/' "${R}/usr/sbin/oem-config-remove-gtk"
+    sed -i 's/ubiquity-slideshow-ubuntu/ubiquity-slideshow-ubuntu-mate/' "${R}/usr/sbin/oem-config-remove-gtk"
+
+    # Create files/dirs Ubiquity requires
+    mkdir -p "${R}/var/log/installer"
+    touch "${R}/var/lib/oem-config/run"
+    touch "${R}/var/log/installer/debug"
+    touch "${R}/var/log/syslog"
+    nspawn chown syslog:adm /var/log/syslog
+    nspawn /usr/sbin/oem-config-prepare --quiet
+
+    # Install seeded snaps during oem-setup
+    #nspawn ln -s /lib/systemd/system/snapd.seeded.service /etc/systemd/system/oem-config.target.wants/snapd.seeded.service
+}
+
+function stage_06_clean() {
+    export B="${B_STAGE_6}"
+    export R="${R_STAGE_6}"
+    sync_from "${B_STAGE_5}" "${R_STAGE_5}"
+
+    nspawn apt-get -y autoremove
+    nspawn apt-get -y autoclean
+    nspawn apt-get -y clean
+
+    rm -f "${B}"/{*.bak,*.old}
+    rm -f "${R}"/wget-log
+    rm -f "${R}"/boot/{*.bak,*.old}
+    rm -f "${R}"/etc/ssh/ssh_host_*_key*
+    rm -f "${R}"/etc/apt/*.save
+    rm -f "${R}"/etc/apt/apt.conf.d/90cache
+    rm -f "${R}"/etc/apt/sources.list.d/*.save
+    rm -f "${R}"/root/.wget-hsts
+    rm -rf "${R}"/tmp/*
+    rm -f "${R}"/var/log/apt/*
+    rm -f "${R}"/var/log/alternatives.log
+    rm -f "${R}"/var/log/bootstrap.log
+    rm -f "${R}"/var/log/dpkg.log
+    rm -f "${R}"/var/log/fontconfig.log
+    rm -f "${R}"/var/cache/fontconfig/CACHEDIR.TAG
+    rm -f "${R}"/var/crash/*
+    rm -rf "${R}"/var/lib/apt/lists/*
+    rm -f "${R}"/var/lib/dpkg/*-old
+    [ -L "${R}"/var/lib/dbus/machine-id ] || rm -f "${R}"/var/lib/dbus/machine-id
+    echo '' > "${R}"/etc/machine-id
+}
+
+function stage_07_image() {
+    export B="${B_STAGE_6}"
+    export R="${R_STAGE_6}"
+
+    # Build the image file
+    local SIZE_BOOT="256"
+    local SIZE_ROOT=0
+    local SIZE_IMG=0
+    local SIZE_PAD=0
+    # Calculate image size accounting for boot parition + 5%
+    SIZE_ROOT=$(du -cs --block-size=MB "${R}" | tail -n1 | cut -d'M' -f1)
+    SIZE_PAD=$(( (SIZE_ROOT / 10) / 2 ))
+    SIZE_IMG=$((SIZE_BOOT + SIZE_ROOT + SIZE_PAD))
+
+    # Create an empty file file.
+    rm -fv "${TMP_DIR}/${IMG_OUT}"
+    fallocate -l "${SIZE_IMG}"M "${TMP_DIR}/${IMG_OUT}"
+
+    # Initialising: msdos
+    parted -s "${TMP_DIR}/${IMG_OUT}" mktable msdos
+    echo "Creating /boot/firmware partition"
+    parted -a optimal -s "${TMP_DIR}/${IMG_OUT}" mkpart primary ext2 1 "${SIZE_BOOT}MB"
+    echo "Creating / partition"
+    parted -a optimal -s "${TMP_DIR}/${IMG_OUT}" mkpart primary ext4 "${SIZE_BOOT}MB" 100%
+    echo "Making partition 1 bootable"
+    parted -s "${TMP_DIR}/${IMG_OUT}" set 1 boot on
+
+    PARTED_OUT=$(parted -s "${TMP_DIR}/${IMG_OUT}" unit b print)
+    BOOT_OFFSET=$(echo "${PARTED_OUT}" | grep -e '^ 1'| xargs echo -n \
+    | cut -d" " -f 2 | tr -d B)
+    BOOT_LENGTH=$(echo "${PARTED_OUT}" | grep -e '^ 1'| xargs echo -n \
+    | cut -d" " -f 4 | tr -d B)
+
+    ROOT_OFFSET=$(echo "${PARTED_OUT}" | grep -e '^ 2'| xargs echo -n \
+    | cut -d" " -f 2 | tr -d B)
+    ROOT_LENGTH=$(echo "${PARTED_OUT}" | grep -e '^ 2'| xargs echo -n \
+    | cut -d" " -f 4 | tr -d B)
+
+    BOOT_LOOP=$(losetup --show -f -o "${BOOT_OFFSET}" --sizelimit "${BOOT_LENGTH}" "${TMP_DIR}/${IMG_OUT}")
+    ROOT_LOOP=$(losetup --show -f -o "${ROOT_OFFSET}" --sizelimit "${ROOT_LENGTH}" "${TMP_DIR}/${IMG_OUT}")
+    echo "/boot/: 	offset ${BOOT_OFFSET}, length ${BOOT_LENGTH}"
+    echo "/:            offset ${ROOT_OFFSET}, length ${ROOT_LENGTH}"
+
+    mkfs.ext2 -n pmOS_boot -m 0 "${BOOT_LOOP}"
+    mkfs.ext4 -L pmOS_root -m 0 "${ROOT_LOOP}"
+
+    MOUNTDIR="${TMP_DIR}/image"
+    mkdir -p "${MOUNTDIR}"
+    mount -v "${ROOT_LOOP}" "${MOUNTDIR}" -t ext4
+    mkdir -p "${MOUNTDIR}/boot"
+    mount -v "${BOOT_LOOP}" "${MOUNTDIR}/boot" -t ext2
+    echo "Syncing root..."
+    rsync -aHAXx --delete "${R}"/ "${MOUNTDIR}/"
+    echo "Syncing boot..."
+    rsync -aHAXx --delete "${B}"/ "${MOUNTDIR}/boot"
+    mkdir -p "${MOUNTDIR}/.disk"
+    date +"%Y%m%d" > "${MOUNTDIR}/.disk/info"
+    sync
+    umount -l "${MOUNTDIR}/boot"
+    umount -l "${MOUNTDIR}"
+    losetup -d "${ROOT_LOOP}"
+    losetup -d "${BOOT_LOOP}"
+    ls -lh "${TMP_DIR}/${IMG_OUT}"
+    rm -rf "${MOUNTDIR}"
+}
+
+function stage_08_compress() {
+    export B="${B_STAGE_6}"
+    export R="${R_STAGE_6}"
+
+    # NOTE! Disabled while iterating
+    echo "Compressing ${IMG_OUT}.xz"
+    rm "${TMP_DIR}/${IMG_OUT}.xz" 2>/dev/null
+    xz --keep -T 0 "${TMP_DIR}/${IMG_OUT}"
+    ls -lh "${TMP_DIR}/${IMG_OUT}.xz"
+
+    local HASH="sha256"
+    local KEY="FFEE1E5C"
+
+    local OUT_HASH="${TMP_DIR}/${IMG_OUT}.xz.${HASH}"
+    local OUT_SIGN="${TMP_DIR}/${IMG_OUT}.xz.${HASH}.sign"
+
+    rm -f "${OUT_HASH}"
+    rm -f "${OUT_SIGN}"
+
+    if [ -e "${TMP_DIR}/${IMG_OUT}.xz" ]; then
+        echo "Hashing ${IMG_OUT}.xz"
+        ${HASH}sum "${TMP_DIR}/${IMG_OUT}.xz" > "${OUT_HASH}"
+        sed -i -r "s/ .*\/(.+)/  \1/g" "${OUT_HASH}"
+        gpg --default-key ${KEY} --armor --output "${OUT_SIGN}" --detach-sig "${OUT_HASH}"
+    else
+        echo "WARNING! Didn't find ${TMP_DIR}/${IMG_OUT} to hash."
+    fi
+}
+
+if [ -z "${SUDO_USER}" ]; then
+  echo "ERROR! You must use sudo to run this script: sudo ./$(basename ${0})"
+  exit 1
+else
+  SUDO_HOME=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+fi
+
+# Install apt-cacher-ng on the host and this script will use it.
+APT_CACHE_IP=$(ip route get 1.1.1.1 | head -n 1 | cut -d' ' -f 7)
+FLAVOUR="ubuntu-mate"
+IMG_QUALITY="" # Or something like "-beta1" for testing images
+IMG_VER="23.04"
+IMG_RELEASE="mantic"
+IMG_ARCH="armhf"
+IMG_OUT="${FLAVOUR}-${IMG_VER}${IMG_QUALITY}-desktop-${IMG_ARCH}+raspi.img"
+TMP_DIR="${SUDO_HOME}/Builds"
+
+# Create caches
+for LOOP in 0 1 2 3 4 5 6 7 8 9; do
+    case ${LOOP} in
+      0)
+        export R_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_cache"
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_cache" 2>/dev/null
+        ;;
+      *)
+        export B_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_boot"
+        export R_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_root"
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_boot" 2>/dev/null
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/${FLAVOUR}/${IMG_VER}/${LOOP}_root/boot/firmware" 2>/dev/null
+        ;;
+    esac
+done
+
+stage_01_bootstrap
+stage_02_desktop
+stage_03_snap
+stage_04_kernel
+stage_05_config
+stage_06_clean
+stage_07_image
+stage_08_compress
