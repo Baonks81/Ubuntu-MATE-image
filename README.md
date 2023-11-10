@@ -42,7 +42,7 @@ IMG_ARCH="armhf"
 
 ### Usage
 
-The following incantation will build a Ubuntu MATE 22.04 armhf image for
+The following incantation will build a Ubuntu MATE 23.04 armhf image for
 Nexus 7 2012 grouper and others armhf.
 
 ```bash
